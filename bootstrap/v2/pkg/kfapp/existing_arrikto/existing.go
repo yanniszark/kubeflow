@@ -21,15 +21,18 @@ import (
 	corev1 "k8s.io/api/v2/core/v1"
 	apierrors "k8s.io/apimachinery/v2/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/v2/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/v2/pkg/runtime"
 	"k8s.io/apimachinery/v2/pkg/types"
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"math/big"
 	"math/rand"
 	"net"
+	"net/url"
 	"os"
 	"path"
 	"sigs.k8s.io/controller-runtime/v2/pkg/client"
+	"sigs.k8s.io/controller-runtime/v2/pkg/controller/controllerutil"
 	"strings"
 	"time"
 )
@@ -287,13 +290,21 @@ func getEndpoints(kubeclient client.Client) (string, string, error) {
 		if err != nil {
 			return "", "", errors.WithStack(err)
 		}
-		// Generate certs for the LoadBalancer IP
-		if err := createSelfSignedCerts(kubeclient, lbIP); err != nil {
-			return "", "", errors.WithStack(err)
-		}
 		kfEndpoint = fmt.Sprintf("https://%s", lbIP)
 		log.Infof("KUBEFLOW_ENDPOINT not set, using %s", kfEndpoint)
 	}
+
+	// Generate certs for the Kubeflow Endpoint
+	uri, err := url.Parse(kfEndpoint)
+	if err != nil {
+		return "", "", errors.WithStack(err)
+	}
+
+	log.Infof("Creating self-signed cert for %s", uri.Hostname())
+	if err := createSelfSignedCerts(kubeclient, uri.Hostname()); err != nil {
+		return "", "", errors.WithStack(err)
+	}
+
 	if oidcEndpoint == "" {
 		oidcEndpoint = fmt.Sprintf("%s:5556/dex", kfEndpoint)
 		log.Infof("OIDC_ENDPOINT not set, using %s", oidcEndpoint)
@@ -315,12 +326,18 @@ func createSelfSignedCerts(kubeclient client.Client, addr string) error {
 			Name:      "istio-ingressgateway-certs",
 			Namespace: "istio-system",
 		},
-		Data: map[string][]byte{
+	}
+
+	_, err = controllerutil.CreateOrUpdate(context.TODO(), kubeclient, secret, func(existing runtime.Object) error {
+		existingSecret := existing.(*corev1.Secret)
+		existingSecret.Data = map[string][]byte{
 			"tls.crt": cert,
 			"tls.key": key,
-		},
-	}
-	if err := kubeclient.Create(context.TODO(), secret); err != nil {
+		}
+
+		return nil
+	})
+	if err != nil {
 		return errors.WithStack(err)
 	}
 
@@ -351,8 +368,12 @@ func generateCert(addr string) ([]byte, []byte, error) {
 	}
 
 	if ip := net.ParseIP(addr); ip != nil {
-		tmpl.IPAddresses = []net.IP{ip}
+		tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+	} else {
+		tmpl.DNSNames = append(tmpl.DNSNames, addr)
 	}
+
+	tmpl.DNSNames = append(tmpl.DNSNames, "localhost")
 
 	certDERBytes, err := x509.CreateCertificate(cryptorand.Reader, &tmpl, &tmpl, key.Public(), key)
 	if err != nil {
@@ -385,7 +406,7 @@ func generateCert(addr string) ([]byte, []byte, error) {
 
 func getLBIP(kubeclient client.Client) (string, error) {
 	// Get IngressGateway Service's ExternalIP
-	const maxRetries = 20
+	const maxRetries = 40
 	var lbIP string
 	svc := &corev1.Service{}
 	for i := 0; ; i++ {
@@ -434,6 +455,10 @@ func deleteManifests(manifests []manifest) error {
 	config := kftypesv2.GetConfig()
 	for _, m := range manifests {
 		log.Infof("Deleting %s...", m.name)
+		if _, err := os.Stat(m.path); os.IsNotExist(err) {
+			log.Warnf("File %s not found", m.path)
+			continue
+		}
 		err := utils.DeleteResourceFromFile(
 			config,
 			m.path,
